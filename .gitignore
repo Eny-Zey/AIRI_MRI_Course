@@ -1,0 +1,15 @@
+# Данные — не коммитим
+ds004873/
+patches/
+labels/
+*.npz
+*.npy
+*.dat
+*.nii
+*.nii.gz
+
+# Питоновский мусор
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.idea/
