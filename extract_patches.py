@@ -10,9 +10,14 @@ LABELS_DIR  = "./labels"
 OUTPUT_DIR  = "./patches"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-PATCH_SIZE        = 32     # размер куба: 16 или 32
-PATCHES_PER_CLASS = 800   # на класс на субъекта (2500*2 = 5000 на субъекта)
+PATCH_SIZE        = 32     # размер куба
+PATCHES_PER_CLASS = 1500   # на класс на субъекта
 RANDOM_SEED       = 42
+
+# --- ФИЛЬТР ПО ЧИСТОТЕ РАЗМЕТКИ ---
+PURITY_FILTER = True
+PURITY_THRESH = 0.8    # порог чистоты окрестности
+PURITY_WIN    = 16     # окно оценки чистоты (меньше патча - это ОК)
 
 ALL_SUBJECTS = [
     "sub-p019", "sub-p020", "sub-p021", "sub-p023", "sub-p026",
@@ -24,12 +29,23 @@ ALL_SUBJECTS = [
 ]
 
 # ----------------------------------------------------------------------
-# ПРОХОД 1: СБОР КООРДИНАТ (лёгкий, без самих патчей)
+# ЧИСТОТА ОКРЕСТНОСТИ
+# ----------------------------------------------------------------------
+def neighborhood_purity(labels, z, y, x, win):
+    h = win // 2
+    cube = labels[z-h:z+h, y-h:y+h, x-h:x+h]
+    labeled = cube[cube > 0]
+    if len(labeled) == 0:
+        return 0.0
+    return np.sum(labeled == labels[z, y, x]) / len(labeled)
+
+# ----------------------------------------------------------------------
+# ПРОХОД 1: СБОР КООРДИНАТ С ФИЛЬТРОМ ЧИСТОТЫ
 # ----------------------------------------------------------------------
 def collect_coords(rng):
-    """Возвращает список (sub_id, t1_path, center_tuple, label01)."""
     plan = []
     half = PATCH_SIZE // 2
+    hp   = max(half, PURITY_WIN // 2)
 
     for sub_id in ALL_SUBJECTS:
         t1_path    = os.path.join(BASE_PATH, "derivatives", sub_id, "anat",
@@ -42,84 +58,95 @@ def collect_coords(rng):
         labels = nib.load(label_path).get_fdata().astype(np.uint8)
         shape = labels.shape
 
-        for cls in (1, 2):  # 1=конкорд., 2=дискорд.
+        for cls in (1, 2):
             coords = np.argwhere(labels == cls)
             if len(coords) == 0:
-                print(f"  ! {sub_id}: нет вокселей класса {cls}")
                 continue
-            # отбрасываем приграничные (патч должен помещаться целиком)
             valid = coords[
-                (coords[:, 0] >= half) & (coords[:, 0] <= shape[0] - half) &
-                (coords[:, 1] >= half) & (coords[:, 1] <= shape[1] - half) &
-                (coords[:, 2] >= half) & (coords[:, 2] <= shape[2] - half)
+                (coords[:,0] >= hp) & (coords[:,0] <= shape[0]-hp) &
+                (coords[:,1] >= hp) & (coords[:,1] <= shape[1]-hp) &
+                (coords[:,2] >= hp) & (coords[:,2] <= shape[2]-hp)
             ]
             if len(valid) == 0:
                 continue
             rng.shuffle(valid)
-            take = valid[:PATCHES_PER_CLASS]
+
             label01 = 0 if cls == 1 else 1
-            for c in take:
-                plan.append((sub_id, t1_path, tuple(int(v) for v in c), label01))
-            print(f"  {sub_id} класс {cls}: запланировано {len(take)} "
-                  f"(валидных {len(valid)})")
+            collected = 0
+            for c in valid:
+                if collected >= PATCHES_PER_CLASS:
+                    break
+                z, y, x = int(c[0]), int(c[1]), int(c[2])
+                if PURITY_FILTER:
+                    if neighborhood_purity(labels, z, y, x, PURITY_WIN) < PURITY_THRESH:
+                        continue
+                plan.append((sub_id, t1_path, (z, y, x), label01))
+                collected += 1
+            print(f"  {sub_id} класс {cls}: собрано {collected}")
 
     return plan
 
 # ----------------------------------------------------------------------
-# ПРОХОД 2: ИЗВЛЕЧЕНИЕ В ПРЕДВЫДЕЛЕННЫЙ МАССИВ
+# ПРОХОД 2: ИЗВЛЕЧЕНИЕ С ПОТОКОВОЙ ЗАПИСЬЮ В MEMMAP (не копит в RAM)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     rng = np.random.default_rng(RANDOM_SEED)
 
-    print("ПРОХОД 1/2: сбор координат...")
+    print("ПРОХОД 1/2: сбор координат с фильтром чистоты...")
+    if PURITY_FILTER:
+        print(f"  Фильтр: чистота окна {PURITY_WIN}^3 >= {PURITY_THRESH}\n")
     plan = collect_coords(rng)
     N = len(plan)
     print(f"\n  Всего патчей: {N}")
 
-    # Предвыделяем массивы СРАЗУ нужного размера (без растущих списков!)
-    X = np.empty((N, 1, PATCH_SIZE, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
-    y = np.empty(N, dtype=np.uint8)
-    subj = np.empty(N, dtype=object)
+    # Перемешиваем ПОРЯДОК записей заранее (чтобы классы/субъекты не блоками),
+    # но сортировку по субъекту делаем для эффективной загрузки T1w.
+    # Решение: пишем в memmap по субъектам, потом сохраняем перемешанный индекс.
 
-    print("\nПРОХОД 2/2: извлечение патчей...")
-    # сортируем по субъекту - T1w грузим один раз на субъекта
-    plan.sort(key=lambda r: r[0])
+    suffix = "_pure" if PURITY_FILTER else ""
+    X_path = os.path.join(OUTPUT_DIR, f"X_{PATCH_SIZE}{suffix}.npy")
+    y_path = os.path.join(OUTPUT_DIR, f"y_{PATCH_SIZE}{suffix}.npy")
+    s_path = os.path.join(OUTPUT_DIR, f"subj_{PATCH_SIZE}{suffix}.npy")
+
+    # Создаём memmap на диске (НЕ в RAM)
+    X_mm = np.lib.format.open_memmap(
+        X_path, mode='w+', dtype=np.float32,
+        shape=(N, 1, PATCH_SIZE, PATCH_SIZE, PATCH_SIZE))
+    y_arr = np.empty(N, dtype=np.int64)
+    s_arr = np.empty(N, dtype=object)
+
+    print("\nПРОХОД 2/2: извлечение (потоковая запись на диск)...")
+    plan.sort(key=lambda r: r[0])   # по субъекту - T1w грузим один раз
 
     half = PATCH_SIZE // 2
-    cur_sub = None
-    t1 = None
+    cur_sub, t1 = None, None
     for i, (sub_id, t1_path, center, label01) in enumerate(plan):
         if sub_id != cur_sub:
             t1 = nib.load(t1_path).get_fdata().astype(np.float32)
             cur_sub = sub_id
             print(f"  {sub_id}...")
         z, yy, x = center
-        X[i, 0] = t1[z-half:z+half, yy-half:yy+half, x-half:x+half]
-        y[i] = label01
-        subj[i] = sub_id
+        X_mm[i, 0] = t1[z-half:z+half, yy-half:yy+half, x-half:x+half]
+        y_arr[i] = label01
+        s_arr[i] = sub_id
 
-    # Перемешиваем единым образом (чтобы классы/субъекты не шли блоками)
-    perm = rng.permutation(N)
-    X, y, subj = X[perm], y[perm], subj[perm]
+    X_mm.flush()
+    np.save(y_path, y_arr)
+    np.save(s_path, s_arr.astype(str))
 
     print(f"\n{'='*50}\nИТОГ\n{'='*50}")
-    print(f"  Форма X: {X.shape}")
-    print(f"  Конкордантных (0): {int(np.sum(y == 0))}")
-    print(f"  Дискордантных (1): {int(np.sum(y == 1))}")
-    print(f"  Субъектов: {len(np.unique(subj))}")
-    print(f"  В памяти: {X.nbytes / 1e9:.2f} ГБ")
+    print(f"  Форма X: {X_mm.shape}")
+    print(f"  Конкордантных (0): {int(np.sum(y_arr == 0))}")
+    print(f"  Дискордантных (1): {int(np.sum(y_arr == 1))}")
+    print(f"  Субъектов: {len(np.unique(s_arr))}")
+    print(f"  X на диске: {os.path.getsize(X_path)/1e9:.2f} ГБ")
+    print(f"\n  Файлы для заливки на Drive:")
+    print(f"    {X_path}")
+    print(f"    {y_path}")
+    print(f"    {s_path}")
 
-    # Сохраняем в сжатый npz (один файл - удобно залить в Colab/Drive)
-    out_path = os.path.join(OUTPUT_DIR, f"patches_{PATCH_SIZE}.npz")
-    print(f"\n  Сохранение в {out_path} (сжатие может занять минуту)...")
-    np.savez_compressed(out_path,
-                        X=X, y=y, subj=subj.astype(str),
-                        patch_size=PATCH_SIZE)
-    print(f"  Готово. Размер на диске: {os.path.getsize(out_path) / 1e9:.2f} ГБ")
-
-    # Сводка по субъектам: сколько патчей у каждого
     print(f"\n  Патчей на субъекта:")
-    uniq, counts = np.unique(subj, return_counts=True)
+    uniq, counts = np.unique(s_arr, return_counts=True)
     for s, c in zip(uniq, counts):
         flag = "  ! мало" if c < 2 * PATCHES_PER_CLASS else ""
         print(f"    {s}: {c}{flag}")
