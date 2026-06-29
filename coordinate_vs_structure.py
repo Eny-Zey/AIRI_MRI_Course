@@ -106,6 +106,9 @@ def collect(rng):
             np.array(labels_out), np.array(subj_out))
 
 def loso(X, y, subj):
+    # возвращает ПОЛНЫЙ массив по субъектам (с NaN там, где один класс),
+    # порядок субъектов = np.unique(subj) — одинаков для всех вызовов,
+    # поэтому массивы выровнены и пригодны для ПАРНОГО теста.
     aucs = []
     for ts in np.unique(subj):
         te = (subj==ts); tr = ~te
@@ -113,8 +116,7 @@ def loso(X, y, subj):
         clf.fit(X[tr], y[tr])
         prob = clf.predict_proba(X[te])[:,1]
         aucs.append(roc_auc_score(y[te], prob) if len(np.unique(y[te]))>1 else np.nan)
-    a = np.array(aucs); a = a[~np.isnan(a)]
-    return a
+    return np.array(aucs)
 
 if __name__ == "__main__":
     rng = np.random.default_rng(RANDOM_SEED)
@@ -123,21 +125,50 @@ if __name__ == "__main__":
     print(f"\nВокселей: {len(y)}, признаков структуры: {S.shape[1]}")
 
     print("\n  Прогон LOSO (RandomForest)...")
-    a_coord  = loso(C, y, subj)
+    a_coord  = loso(C, y, subj)               # массив 29 (с возможными NaN)
     a_struct = loso(S, y, subj)
     a_both   = loso(np.hstack([C, S]), y, subj)
+    subjects = np.unique(subj)
+
+    # --- синхронная фильтрация NaN: выкидываем субъекта, если NaN хоть в одном прогоне ---
+    from scipy import stats
+    ok = ~(np.isnan(a_coord) | np.isnan(a_struct) | np.isnan(a_both))
+    ac, as_, ab = a_coord[ok], a_struct[ok], a_both[ok]
+    n = ok.sum()
 
     print(f"\n{'='*55}")
-    print(f"  Только КООРДИНАТЫ:        AUC {a_coord.mean():.3f} ± {a_coord.std(ddof=1):.3f}")
-    print(f"  Только СТРУКТУРА:         AUC {a_struct.mean():.3f} ± {a_struct.std(ddof=1):.3f}")
-    print(f"  КООРДИНАТЫ + СТРУКТУРА:   AUC {a_both.mean():.3f} ± {a_both.std(ddof=1):.3f}")
+    print(f"  Субъектов в анализе: {n} (из {len(subjects)})")
+    print(f"  Только КООРДИНАТЫ:        AUC {ac.mean():.3f} ± {ac.std(ddof=1):.3f}")
+    print(f"  Только СТРУКТУРА:         AUC {as_.mean():.3f} ± {as_.std(ddof=1):.3f}")
+    print(f"  КООРДИНАТЫ + СТРУКТУРА:   AUC {ab.mean():.3f} ± {ab.std(ddof=1):.3f}")
     print(f"{'='*55}")
-    print(f"\n  Прирост от добавления структуры к координатам: "
-          f"{a_both.mean()-a_coord.mean():+.3f}")
-    if a_both.mean() - a_coord.mean() > 0.02 and a_struct.mean() > 0.55:
-        print("  ВЫВОД: структура несёт информацию СВЕРХ локализации.")
-    elif a_struct.mean() < 0.53:
-        print("  ВЫВОД: структура сама по себе почти не предсказывает —")
-        print("         сигнал в основном от локализации.")
+
+    # --- ПАРНЫЕ t-тесты (те же субъекты) ---
+    print("\n  ПАРНЫЕ t-тесты (по субъектам):")
+    t1, p1 = stats.ttest_rel(ab, ac)
+    print(f"    координаты+структура vs координаты: "
+          f"Δ={ab.mean()-ac.mean():+.3f}, t={t1:.2f}, p={p1:.4f}")
+    t2, p2 = stats.ttest_rel(as_, ac)
+    print(f"    структура vs координаты:            "
+          f"Δ={as_.mean()-ac.mean():+.3f}, t={t2:.2f}, p={p2:.4f}")
+    # структура сама против 0.5
+    t3, p3 = stats.ttest_1samp(as_, 0.5)
+    print(f"    структура vs случайность (0.5):     "
+          f"t={t3:.2f}, p={p3:.4f}")
+
+    print("\n  ИНТЕРПРЕТАЦИЯ:")
+    if p1 < 0.05 and ab.mean() > ac.mean():
+        print("    Прирост от структуры СТАТИСТИЧЕСКИ ЗНАЧИМ (p<0.05).")
+        print("    Структура несёт информацию сверх локализации.")
     else:
-        print("  ВЫВОД: структура добавляет мало сверх координат.")
+        print(f"    Прирост от структуры НЕ значим (p={p1:.3f}).")
+        print("    Нельзя утверждать, что структура добавляет сверх координат.")
+
+    # --- сохраняем per-fold для воспроизводимости ---
+    import csv
+    with open("coord_vs_struct_perfold.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["subj","auc_coord","auc_struct","auc_both"])
+        for i, s in enumerate(subjects):
+            w.writerow([s, a_coord[i], a_struct[i], a_both[i]])
+    print("\n  Per-fold сохранён: coord_vs_struct_perfold.csv")

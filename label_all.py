@@ -29,9 +29,16 @@ ALL_SUBJECTS = [
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ----------------------------------------------------------------------
 def resample_if_needed(img, ref_img, interpolation='linear'):
-    if img.shape[:3] != ref_img.shape[:3]:
-        return resample_to_img(img, ref_img, interpolation=interpolation)
-    return img
+    data = img.get_fdata(dtype=np.float32)
+    if not np.isfinite(data).all():
+        data = data.copy()
+        data[~np.isfinite(data)] = np.nan        # inf -> NaN; NaN остаётся NaN
+        img = nib.Nifti1Image(data, img.affine, img.header)
+    same_shape  = img.shape[:3] == ref_img.shape[:3]
+    same_affine = np.allclose(img.affine, ref_img.affine, atol=1e-4)
+    if same_shape and same_affine:
+        return img
+    return resample_to_img(img, ref_img, interpolation=interpolation)
 
 def md5(path):
     h = hashlib.md5()
@@ -58,8 +65,19 @@ def label_subject(sub_id):
     # --- Пути к файлам ---
     t1_path       = os.path.join(BASE_PATH, "derivatives", sub_id, "anat",
                         f"{sub_id}_desc-fmriprep_T1w.nii.gz")
+    #contrast_path = os.path.join(BASE_PATH, "derivatives", sub_id, "func",
+                        #f"{sub_id}_1stlevel_calccontrol_space-T2.nii.gz")
     contrast_path = os.path.join(BASE_PATH, "derivatives", sub_id, "func",
-                        f"{sub_id}_1stlevel_calccontrol_space-T2.nii.gz")
+                    f"{sub_id}_task-calccontrol_space-MNI152_res-2_desc-percchange_bold.nii.gz")
+    # БЫЛО: orig calc в T1w.
+    # СТАЛО: semi-quant-corrected calc — числитель ΔCMRO₂ (рекомендация авторов,
+    # R2′ выведен из BOLD-изменения CALC−CTRL, шум подавлен). Лежит только в T2 —
+    # ресемпл в T1w делает resample_if_needed. У p019 это .nii, у остальных .nii.gz.
+    _semi_gz = os.path.join(BASE_PATH, "derivatives", sub_id, "qmri",
+                   f"{sub_id}_task-calc_base-control_space-T2_desc-semi-quant-corrected_cmro2.nii.gz")
+    
+    ## ВОТ ЗДЕСЬ ЛЕЖИТ ПУТЬ К CALC CMRO - ОН МОЖЕТ БЫТЬ ОРИГ, А МОЖЕТ БЫТЬ СЕМИ КВАНТ
+    #calc_cmro2_path = _semi_gz if os.path.exists(_semi_gz) else _semi_gz[:-3]  # fallback на .nii
     calc_cmro2_path = os.path.join(BASE_PATH, "derivatives", sub_id, "qmri",
                         f"{sub_id}_task-calc_space-T1w_desc-orig_cmro2.nii.gz")
     ctrl_cmro2_path = os.path.join(BASE_PATH, "derivatives", sub_id, "qmri",
@@ -141,7 +159,9 @@ def label_subject(sub_id):
     delta_cmro2_pct = (calc_cmro2 - ctrl_cmro2) / (np.abs(ctrl_cmro2) + eps) * 100.0
 
     # --- Маска активных вокселей ---
-    mask_active = (np.abs(contrast_t1w) > Z_THRESH) & combined_mask
+    #mask_active = (np.abs(contrast_t1w) > Z_THRESH) & combined_mask
+    mask_active = (np.abs(contrast_t1w) > 1.0) & combined_mask
+
     print(f"  Активных вокселей (|Z| > {Z_THRESH}): {np.sum(mask_active)}")
 
     # --- Классификация ---
